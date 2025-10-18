@@ -1,0 +1,501 @@
+use darling::FromMeta;
+use proc_macro::TokenStream;
+use proc_macro_error::abort;
+use proc_macro_error::emit_error;
+use quote::{format_ident, quote};
+use std::iter;
+use syn::Ident;
+use syn::Token;
+use syn::Type;
+use syn::spanned::Spanned;
+use syn::{ItemFn, parse_macro_input, visit::Visit};
+
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodArtifact as WfArtifact;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodInputs as WfInputs;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodOutputs as WfOutputs;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodParameter as WfParameter;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodRawArtifact as WfRawArtifact;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodTemplate as WfTemplate;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodValueFrom as WfValueFrom;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodWorkflowSpec as WfSpec;
+use argo_workflows_api::models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodWorkflowTemplate as WfTemplateSpec;
+use argo_workflows_api::models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodContainer as K8sContainer;
+use argo_workflows_api::models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodEmptyDirVolumeSource as K8sEmptyDirVolumeSource;
+use argo_workflows_api::models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodEnvVar as K8sEnvVar;
+use argo_workflows_api::models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodHostPathVolumeSource as WfHostPathVolumeSource;
+use argo_workflows_api::models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodVolume as WfVolume;
+use argo_workflows_api::models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodVolumeMount as K8sVolumeMount;
+use argo_workflows_api::models::IoPeriodK8sPeriodApimachineryPeriodPkgPeriodApisPeriodMetaPeriodV1PeriodObjectMeta as K8sObjectMeta;
+
+use argo_assembler_common::*;
+
+use crate::Kebab;
+use crate::get_workflow_template_name;
+
+pub struct MountPathVisitor {
+    pub mount_paths: Vec<String>,
+}
+
+impl MountPathVisitor {
+    pub fn new() -> Self {
+        Self {
+            mount_paths: Vec::new(),
+        }
+    }
+}
+
+/// this is separated because the init_container only needs
+/// access to input volumes, so it is pointless to mount
+/// all of the volumes
+fn get_inputs_volume_mount() -> K8sVolumeMount {
+    K8sVolumeMount::new(
+        ARGO_ASSEMBLER_INPUTS_PATH.to_string(),
+        ARGO_ASSEMBLER_INPUTS_NAME.to_string(),
+    )
+}
+
+fn get_default_volumes() -> (Vec<K8sVolumeMount>, Vec<WfVolume>) {
+    // TODO: add assert to make sure mounts match volumes
+    (
+        vec![
+            get_inputs_volume_mount(),
+            K8sVolumeMount::new(
+                ARGO_ASSEMBLER_OUTPUTS_PATH.to_string(),
+                ARGO_ASSEMBLER_OUTPUTS_NAME.to_string(),
+            ),
+            K8sVolumeMount::new(
+                ARGO_ASSEMBLER_SCRATCH_PATH.to_string(),
+                ARGO_ASSEMBLER_SCRATCH_NAME.to_string(),
+            ),
+            K8sVolumeMount::new(
+                "/mnt//argo-assembler/src".to_string(),
+                "delete-me-binary".to_string(),
+            ),
+        ],
+        vec![
+            WfVolume {
+                name: ARGO_ASSEMBLER_INPUTS_NAME.to_string(),
+                empty_dir: Some(Box::new(K8sEmptyDirVolumeSource::new())),
+                ..Default::default()
+            },
+            WfVolume {
+                name: ARGO_ASSEMBLER_OUTPUTS_NAME.to_string(),
+                empty_dir: Some(Box::new(K8sEmptyDirVolumeSource::new())),
+                ..Default::default()
+            },
+            WfVolume {
+                name: ARGO_ASSEMBLER_SCRATCH_NAME.to_string(),
+                empty_dir: Some(Box::new(K8sEmptyDirVolumeSource::new())),
+                ..Default::default()
+            },
+            WfVolume {
+                name: "delete-me-binary".to_string(),
+                host_path: Some(Box::new(WfHostPathVolumeSource::new(
+                    "/home/masaparov/build/hat-rs-test".to_string(),
+                ))),
+                ..Default::default()
+            },
+        ],
+    )
+}
+
+fn build_workflow_spec(
+    args: &Args,
+    name: &Ident,
+    volumes: &[String],
+    inputs: &[(syn::Ident, syn::Type)],
+    has_output: bool,
+) -> WfTemplateSpec {
+    let input_parameters = (0..inputs.len())
+        .map(|i| WfParameter {
+            name: format!("input-{:02}", i),
+            ..Default::default()
+        })
+        .collect();
+
+    let input_artifacts = (0..inputs.len())
+        .map(|i| WfArtifact {
+            name: format!("input-{:02}", i),
+            path: Some(format!("{}/{}", ARGO_ASSEMBLER_INPUTS_PATH, i)),
+            raw: Some(Box::new(WfRawArtifact::new(format!(
+                "{{{{inputs.parameters.input-{:02}}}}}",
+                i
+            )))),
+            ..Default::default()
+        })
+        .collect();
+
+    let available_volumes = volumes
+        .iter()
+        .map(|mount| {
+            let name = hash_and_encode(mount);
+
+            WfVolume {
+                name,
+                host_path: Some(Box::new(WfHostPathVolumeSource::new(mount.to_string()))),
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    let volume_mounts = volumes
+        .iter()
+        .map(|mount| {
+            let name = hash_and_encode(mount);
+
+            K8sVolumeMount::new(format!("{}/{}", ARGO_ASSEMBLER_VOLUMES_PATH, name), name)
+        })
+        .collect();
+
+    let container = K8sContainer {
+        name: Some("run".to_string()),
+        image: "rust".to_string(), // TODO
+        env: Some(vec![
+            // TODO: make sure all env variables are set as expected
+            K8sEnvVar::new(IS_CONTAINER_ENV.to_string()),
+            K8sEnvVar {
+                name: CURRENT_CONTAINER.to_string(),
+                value: Some(name.to_string()),
+                ..Default::default()
+            },
+            K8sEnvVar {
+                name: "RUST_LOG".to_string(),
+                value: args.log_level.clone(),
+                ..Default::default()
+            },
+        ]),
+        volume_mounts: Some([get_default_volumes().0, volume_mounts].concat()),
+        command: Some(vec!["cargo".to_string()]), // TODO
+        args: Some(vec![
+            "run".to_string(),
+            "--manifest-path".to_string(),
+            "/mnt//argo-assembler/src/Cargo.toml".to_string(),
+        ]), // TODO
+        ..Default::default()
+    };
+
+    let output_parameters = match has_output {
+        false => None,
+        true => Some(vec![WfParameter {
+            name: "result".to_string(),
+            value_from: Some(Box::new(WfValueFrom {
+                path: Some(ARGO_ASSEMBLER_DEFAULT_OUTPUT_PATH.to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }]),
+    };
+
+    let template = WfTemplate {
+        name: Some(Kebab(name.to_string()).to_string()),
+        inputs: Some(Box::new(WfInputs {
+            artifacts: Some(input_artifacts),
+            parameters: Some(input_parameters),
+        })),
+        outputs: Some(Box::new(WfOutputs {
+            artifacts: None,
+            parameters: output_parameters,
+            ..Default::default()
+        })),
+        container: Some(Box::new(container)),
+        volumes: Some([get_default_volumes().1, available_volumes].concat()),
+        ..Default::default()
+    };
+
+    let spec = WfSpec {
+        templates: Some(vec![template]),
+        ..Default::default()
+    };
+
+    let meta = K8sObjectMeta {
+        name: Some(get_workflow_template_name(&name.to_string())),
+        ..Default::default()
+    };
+
+    const WF_TEMPLATE_SPEC_KIND: &str = "WorkflowTemplate";
+
+    WfTemplateSpec {
+        kind: Some(WF_TEMPLATE_SPEC_KIND.to_string()),
+        api_version: Some("argoproj.io/v1alpha1".to_string()),
+        metadata: Box::new(meta),
+        spec: Box::new(spec),
+    }
+}
+
+fn parse_function_inputs(function: &ItemFn) -> Vec<(Ident, Type)> {
+    function
+        .sig
+        .inputs
+        .iter()
+        .map(|arg| {
+            if let syn::FnArg::Typed(pat_type) = arg {
+                match pat_type.pat.as_ref() {
+                    syn::Pat::Ident(pat_ident) => {
+                        (pat_ident.ident.clone(), *pat_type.ty.clone())
+                    }
+                    syn::Pat::Wild(pat_wild) => {
+                        abort!(
+                            pat_wild, "unnamed variables not allowed in containers";
+
+                            note = "append an identifier if you are going to use the variable later";
+                            hint = "_a: {}", stringify!(pat_type.ty);
+                        )
+                    },
+                    _ => {
+                        abort!(pat_type.pat, "rust feature is not implemented");
+                    }
+                }
+            } else {
+                unreachable!("this case is handled by the rust compiler");
+            }
+        })
+        .collect()
+}
+
+impl<'ast> Visit<'ast> for MountPathVisitor {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if let Some(ident) = mac.path.get_ident()
+            && ident == REGISTER_HOST_VOLUME
+        {
+            let tokens: Vec<_> = mac.tokens.clone().into_iter().collect();
+            if let Some(proc_macro2::TokenTree::Literal(lit)) = tokens.first() {
+                let path_str = lit.to_string();
+                let path_str = path_str.trim_matches('"');
+
+                if !self.mount_paths.contains(&path_str.to_string()) {
+                    self.mount_paths.push(path_str.to_string());
+                }
+            }
+        }
+        syn::visit::visit_macro(self, mac);
+    }
+}
+
+#[derive(Debug, FromMeta)]
+#[darling(derive_syn_parse)]
+struct Args {
+    log_level: Option<String>,
+    #[darling(rename = "activeDeadlineSeconds")]
+    active_deadline_seconds: Option<String>,
+    #[darling(rename = "affinity")]
+    affinity: Option<Box<models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodAffinity>>,
+    /// Annotations is a list of annotations to add to the template at runtime
+    #[darling(rename = "annotations")]
+    pub annotations: Option<std::collections::HashMap<String, String>>,
+    #[serde(rename = "archiveLocation", skip_serializing_if = "Option::is_none")]
+    pub archive_location:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodArtifactLocation>>,
+    /// AutomountServiceAccountToken indicates whether a service account token should be automatically mounted in pods. ServiceAccountName of ExecutorConfig must be specified if this value is false.
+    #[darling(rename = "automountServiceAccountToken")]
+    pub automount_service_account_token: Option<bool>,
+    #[serde(rename = "container", skip_serializing_if = "Option::is_none")]
+    pub container: Option<Box<models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodContainer>>,
+    #[serde(rename = "containerSet", skip_serializing_if = "Option::is_none")]
+    pub container_set:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodContainerSetTemplate>>,
+    /// Daemon will allow a workflow to proceed to the next step so long as the container reaches readiness
+    #[serde(rename = "daemon", skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<bool>,
+    #[serde(rename = "dag", skip_serializing_if = "Option::is_none")]
+    pub dag: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodDagTemplate>>,
+    #[serde(rename = "data", skip_serializing_if = "Option::is_none")]
+    pub data: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodData>>,
+    #[serde(rename = "executor", skip_serializing_if = "Option::is_none")]
+    pub executor:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodExecutorConfig>>,
+    /// FailFast, if specified, will fail this template if any of its child pods has failed. This is useful for when this template is expanded with `withItems`, etc.
+    #[serde(rename = "failFast", skip_serializing_if = "Option::is_none")]
+    pub fail_fast: Option<bool>,
+    /// HostAliases is an optional list of hosts and IPs that will be injected into the pod spec
+    #[serde(rename = "hostAliases", skip_serializing_if = "Option::is_none")]
+    pub host_aliases: Option<Vec<models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodHostAlias>>,
+    #[serde(rename = "http", skip_serializing_if = "Option::is_none")]
+    pub http: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodHttp>>,
+    /// InitContainers is a list of containers which run before the main container.
+    #[serde(rename = "initContainers", skip_serializing_if = "Option::is_none")]
+    pub init_containers:
+        Option<Vec<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodUserContainer>>,
+    #[serde(rename = "inputs", skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodInputs>>,
+    #[serde(rename = "memoize", skip_serializing_if = "Option::is_none")]
+    pub memoize: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodMemoize>>,
+    #[serde(rename = "metadata", skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodMetadata>>,
+    #[serde(rename = "metrics", skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodMetrics>>,
+    /// Name is the name of the template
+    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// NodeSelector is a selector to schedule this step of the workflow to be run on the selected node(s). Overrides the selector set at the workflow level.
+    #[serde(rename = "nodeSelector", skip_serializing_if = "Option::is_none")]
+    pub node_selector: Option<std::collections::HashMap<String, String>>,
+    #[serde(rename = "outputs", skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodOutputs>>,
+    /// Parallelism limits the max total parallel pods that can execute at the same time within the boundaries of this template invocation. If additional steps/dag templates are invoked, the pods created by those templates will not be counted towards this total.
+    #[serde(rename = "parallelism", skip_serializing_if = "Option::is_none")]
+    pub parallelism: Option<i32>,
+    /// Plugin is an Object with exactly one key
+    #[serde(rename = "plugin", skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<serde_json::Value>,
+    /// PodSpecPatch holds strategic merge patch to apply against the pod spec. Allows parameterization of container fields which are not strings (e.g. resource limits).
+    #[serde(rename = "podSpecPatch", skip_serializing_if = "Option::is_none")]
+    pub pod_spec_patch: Option<String>,
+    /// PriorityClassName to apply to workflow pods.
+    #[serde(rename = "priorityClassName", skip_serializing_if = "Option::is_none")]
+    pub priority_class_name: Option<String>,
+    #[serde(rename = "resource", skip_serializing_if = "Option::is_none")]
+    pub resource:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodResourceTemplate>>,
+    #[serde(rename = "retryStrategy", skip_serializing_if = "Option::is_none")]
+    pub retry_strategy:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodRetryStrategy>>,
+    /// If specified, the pod will be dispatched by specified scheduler. Or it will be dispatched by workflow scope scheduler if specified. If neither specified, the pod will be dispatched by default scheduler.
+    #[serde(rename = "schedulerName", skip_serializing_if = "Option::is_none")]
+    pub scheduler_name: Option<String>,
+    #[serde(rename = "script", skip_serializing_if = "Option::is_none")]
+    pub script:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodScriptTemplate>>,
+    #[serde(rename = "securityContext", skip_serializing_if = "Option::is_none")]
+    pub security_context:
+        Option<Box<models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodPodSecurityContext>>,
+    /// ServiceAccountName to apply to workflow pods
+    #[serde(rename = "serviceAccountName", skip_serializing_if = "Option::is_none")]
+    pub service_account_name: Option<String>,
+    /// Sidecars is a list of containers which run alongside the main container Sidecars are automatically killed when the main container completes
+    #[serde(rename = "sidecars", skip_serializing_if = "Option::is_none")]
+    pub sidecars:
+        Option<Vec<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodUserContainer>>,
+    /// Steps define a series of sequential/parallel workflow steps
+    #[serde(rename = "steps", skip_serializing_if = "Option::is_none")]
+    pub steps:
+        Option<Vec<Vec<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodWorkflowStep>>>,
+    #[serde(rename = "suspend", skip_serializing_if = "Option::is_none")]
+    pub suspend:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodSuspendTemplate>>,
+    #[serde(rename = "synchronization", skip_serializing_if = "Option::is_none")]
+    pub synchronization:
+        Option<Box<models::IoPeriodArgoprojPeriodWorkflowPeriodV1alpha1PeriodSynchronization>>,
+    /// Timeout allows to set the total node execution timeout duration counting from the node's start time. This duration also includes time in which the node spends in Pending state. This duration may not be applied to Step or DAG templates.
+    #[serde(rename = "timeout", skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+    /// Tolerations to apply to workflow pods.
+    #[serde(rename = "tolerations", skip_serializing_if = "Option::is_none")]
+    pub tolerations: Option<Vec<models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodToleration>>,
+    /// Volumes is a list of volumes that can be mounted by containers in a template.
+    #[serde(rename = "volumes", skip_serializing_if = "Option::is_none")]
+    pub volumes: Option<Vec<models::IoPeriodK8sPeriodApiPeriodCorePeriodV1PeriodVolume>>,
+}
+
+pub fn container(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let args: Args = match syn::parse(attr) {
+        Ok(v) => v,
+        Err(e) => {
+            return e.to_compile_error().into();
+        }
+    };
+
+    let mut function = parse_macro_input!(item as ItemFn);
+    if !function.attrs.is_empty() {
+        todo!()
+    }
+
+    let mut visitor = MountPathVisitor::new();
+    visitor.visit_item_fn(&function);
+
+    let function_inputs: Vec<(syn::Ident, syn::Type)> = parse_function_inputs(&function);
+    let function_inputs_idents: Vec<syn::Ident> =
+        function_inputs.iter().map(|v| v.0.clone()).collect();
+
+    function_inputs_idents.iter().for_each(|v| {
+        if v.to_string().starts_with("_unused_") {
+            emit_error!(
+                v, "arguments may not start with _unused_ as it's reserved for internal use";
+                note = "this is caused by wild arguments (_) being replaced with _unused_";
+                hint = "can be replaced with literally anything else";
+            );
+        }
+    });
+
+    let function_inputs_types: Vec<syn::Type> =
+        function_inputs.iter().map(|v| v.1.clone()).collect();
+
+    let function_inputs_types_remainder: Vec<syn::Type> = iter::repeat_n(
+        syn::parse_str("()").unwrap(),
+        MAX_FN_INPUTS - function_inputs.len(),
+    )
+    .collect();
+    let function_inputs_idents_remainder: Vec<syn::Ident> = (function_inputs.len()..MAX_FN_INPUTS)
+        .map(|i| format_ident!("_unused_{}", i))
+        .collect();
+
+    let volumes = visitor.mount_paths;
+
+    let has_output = !matches!(function.sig.output, syn::ReturnType::Default);
+
+    let function_name = function.sig.ident.clone();
+
+    if std::env::var("CARGO_BIN_NAME").is_ok() {
+        let template = build_workflow_spec(
+            &args,
+            &function_name,
+            &volumes,
+            &function_inputs,
+            has_output,
+        );
+
+        let _ = std::fs::create_dir("templates");
+
+        std::fs::write(
+            format!(
+                "templates/{}.template.yaml",
+                Kebab(function_name.to_string()),
+            ),
+            serde_yaml::to_string(&template).unwrap(),
+        )
+        .expect("BUG: unable to write to templates directory");
+    }
+
+    let function_body = &function.block;
+    let function_name = function.sig.ident.clone();
+    let dist_slice_name = format_ident!(
+        "__{}_DISTRIBUTED_SLICE",
+        &function_name.to_string().to_uppercase()
+    );
+    let function_vis = function.vis.clone();
+    function.vis = syn::Visibility::Public(Token![pub](function.vis.span()));
+
+    TokenStream::from(quote! {
+        #[allow(non_camel_case_types)]
+        #function_vis struct #function_name;
+
+        #[::argo_assembler::linkme::distributed_slice(::argo_assembler::CONTAINER_FNS)]
+        #[linkme(crate = ::argo_assembler::linkme)]
+        static #dist_slice_name: (&str, fn() -> Result<(), ::argo_assembler::ContainerFunctionError>) = (stringify!(#function_name), #function_name::__run);
+
+        impl #function_name {
+            #[allow(unused)]
+            #function
+
+            pub fn __run() -> Result<(), ::argo_assembler::ContainerFunctionError> {
+                ::argo_assembler::init_default_container_tracing();
+
+                ::argo_assembler::tracing::info_span!(stringify!(#function_name)).in_scope(|| {
+                    <Self as ::argo_assembler::ContainerFunction<_,_,_,_,_,_,_,_>>::run_container_fn(&#function_name)
+                })
+            }
+        }
+
+        impl ::argo_assembler::ContainerFunction<#(#function_inputs_types,)* #(#function_inputs_types_remainder),*> for #function_name {
+            #[::argo_assembler::tracing::instrument(ret, skip(#(#function_inputs_idents_remainder),*))]
+            fn exec(#(#function_inputs_idents: #function_inputs_types,)* #(#function_inputs_idents_remainder: #function_inputs_types_remainder),*) -> impl ::argo_assembler::serde::Serialize + ::std::fmt::Debug #function_body
+
+            fn has_output(&self) -> bool {
+                #has_output
+            }
+
+            fn _get_mount_paths() -> Vec<&'static str> {
+                vec![#(#volumes),*]
+            }
+        }
+    })
+}
